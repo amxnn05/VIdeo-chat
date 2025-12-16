@@ -25,14 +25,7 @@ cd VIdeo-chat
 
 ### 2. Server Setup
 
-Navigate to the server directory and install dependencies:
-
-```bash
-cd server
-npm install
-```
-
-Create a `.env` file in the `server` directory (if required by the server logic, otherwise skip).
+Create a `.env` file in the `server` directory.
 
 
 ## Running the Application
