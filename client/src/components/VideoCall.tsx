@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as nsfwjs from 'nsfwjs';
-import { useAgora } from '../hooks/useAgora';
+import { useWebRTC } from '../hooks/useWebRTC';
 import './VideoCall.css';
 
 interface VideoCallProps {
@@ -9,8 +9,8 @@ interface VideoCallProps {
 
 export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 	const {
-		localVideoTrack,
-		remoteUsers,
+		localStream,
+		remoteStream,
 		isSearching,
 		isConnected,
 		messages,
@@ -21,7 +21,7 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 		sendMessage,
 		toggleAudio,
 		toggleVideo,
-	} = useAgora();
+	} = useWebRTC();
 
 	const [input, setInput] = useState('');
 	const [isAudioEnabled, setIsAudioEnabled] = useState(true);
@@ -30,8 +30,8 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 	const [isModelLoaded, setIsModelLoaded] = useState(false);
 	const messagesEndRef = useRef<HTMLDivElement>(null);
 
-	const localVideoRef = useRef<HTMLDivElement>(null);
-	const remoteVideoRef = useRef<HTMLDivElement>(null);
+	const localVideoRef = useRef<HTMLVideoElement>(null);
+	const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
 	// Hidden video element for NSFWJS analysis
 	const analysisVideoRef = useRef<HTMLVideoElement>(null);
@@ -46,6 +46,18 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 		};
 	}, []);
 
+	useEffect(() => {
+		if (localVideoRef.current && localStream) {
+			localVideoRef.current.srcObject = localStream;
+		}
+	}, [localStream]);
+
+	useEffect(() => {
+		if (remoteVideoRef.current && remoteStream) {
+			remoteVideoRef.current.srcObject = remoteStream;
+		}
+	}, [remoteStream]);
+
 	const loadModel = async () => {
 		try {
 			const loadedModel = await nsfwjs.load();
@@ -58,39 +70,23 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 		}
 	};
 
-	// Play Local Video
+	// Play Local Video Logic and Analysis
 	useEffect(() => {
-		if (localVideoTrack && localVideoRef.current) {
-			localVideoTrack.play(localVideoRef.current);
-
+		if (localStream) {
 			// Setup for NSFW analysis ONLY if model is loaded
 			if (isModelLoaded && analysisVideoRef.current) {
 				try {
-					const stream = new MediaStream([localVideoTrack.getMediaStreamTrack()]);
-					analysisVideoRef.current.srcObject = stream;
+					analysisVideoRef.current.srcObject = localStream;
 				} catch (e) {
 					console.warn("Failed to create analysis stream:", e);
 				}
 			}
 		}
-		return () => {
-			localVideoTrack?.stop();
-		};
-	}, [localVideoTrack, isModelLoaded]);
-
-	// Play Remote Video
-	useEffect(() => {
-		if (remoteUsers.length > 0 && remoteUsers[0].videoTrack && remoteVideoRef.current) {
-			remoteUsers[0].videoTrack.play(remoteVideoRef.current);
-		}
-		if (remoteUsers.length > 0 && remoteUsers[0].audioTrack) {
-			remoteUsers[0].audioTrack.play();
-		}
-	}, [remoteUsers]);
+	}, [localStream, isModelLoaded]);
 
 	// Content Moderation Loop
 	useEffect(() => {
-		if (isModelLoaded && model && analysisVideoRef.current && localVideoTrack) {
+		if (isModelLoaded && model && analysisVideoRef.current && localStream) {
 			checkInterval.current = setInterval(async () => {
 				if (analysisVideoRef.current && analysisVideoRef.current.readyState === 4) {
 					try {
@@ -100,9 +96,6 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 
 						if ((porn && porn.probability > 0.6) || (hentai && hentai.probability > 0.6)) {
 							console.warn('NSFW Content Detected!', predictions);
-							// In Agora version, we might want to just stop the stream or alert
-							// Since we removed socket.io 'ban_me', we can't easily self-ban on server without an API endpoint
-							// For now, just stop local video
 							toggleVideo(false);
 							setIsVideoEnabled(false);
 							alert("NSFW content detected. Your video has been disabled.");
@@ -117,7 +110,7 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 		return () => {
 			if (checkInterval.current) clearInterval(checkInterval.current);
 		};
-	}, [model, localVideoTrack, isModelLoaded]);
+	}, [model, localStream, isModelLoaded]);
 
 	useEffect(() => {
 		messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -147,7 +140,8 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 			<div className="main-content">
 				<div className="video-grid">
 					<div className="video-wrapper local">
-						<div ref={localVideoRef} className="video-container" />
+						{ /* Changed to video element */}
+						<video ref={localVideoRef} autoPlay muted className="video-container" />
 						{/* Hidden video for analysis */}
 						<video ref={analysisVideoRef} autoPlay muted style={{ display: 'none' }} />
 
@@ -170,8 +164,8 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 						</div>
 					</div>
 					<div className="video-wrapper remote">
-						{remoteUsers.length > 0 && remoteUsers[0].videoTrack ? (
-							<div ref={remoteVideoRef} className="video-container" />
+						{remoteStream ? (
+							<video ref={remoteVideoRef} autoPlay className="video-container" />
 						) : (
 							<div className="placeholder">
 								{isSearching ? 'Looking for someone...' : 'Click Start to find a partner'}
@@ -232,3 +226,4 @@ export const VideoCall: React.FC<VideoCallProps> = ({ user }) => {
 		</div>
 	);
 };
+

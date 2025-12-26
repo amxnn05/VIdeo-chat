@@ -1,141 +1,160 @@
 import { v4 as uuidv4 } from 'uuid';
+import { Server, Socket } from 'socket.io';
 
 interface User {
 	id: string;
+	socketId: string;
 	name: string;
-	lastPoll: number;
-	partnerId: string | null;
+	partnerSocketId: string | null;
 	agoraChannel: string | null;
 	isInitiator: boolean;
 }
 
 export class Matchmaker {
-	private queue: string[] = [];
-	private users: Map<string, User> = new Map();
-	private CLEANUP_INTERVAL = 5000; // 5 seconds
-	private USER_TIMEOUT = 10000; // 10 seconds timeout for inactive users
+	private queue: string[] = []; // socketIds
+	private users: Map<string, User> = new Map(); // socketId -> User
+	private io: Server;
 
-	constructor() {
-		// Cleanup interval to remove inactive users
-		setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
+	constructor(io: Server) {
+		this.io = io;
 	}
 
-	public joinQueue(name: string): { userId: string } {
-		const userId = uuidv4();
+	public handleConnection(socket: Socket) {
+		console.log(`User connected: ${socket.id}`);
+
+		socket.on('join_queue', (data: { name: string }) => {
+			this.joinQueue(socket.id, data.name);
+		});
+
+		socket.on('disconnect', () => {
+			this.handleDisconnect(socket.id);
+		});
+
+		socket.on('leave_queue', () => {
+			this.handleDisconnect(socket.id);
+		});
+
+		// WebRTC Signaling
+		socket.on('signal', (data: any) => {
+			const user = this.users.get(socket.id);
+			if (user && user.partnerSocketId) {
+				this.io.to(user.partnerSocketId).emit('signal', data);
+			}
+		});
+
+		// Chat Messages
+		socket.on('chat_message', (data: { text: string }) => {
+			const user = this.users.get(socket.id);
+			console.log(`Chat message from ${socket.id} to ${user?.partnerSocketId}: ${data.text}`);
+			if (user && user.partnerSocketId) {
+				this.io.to(user.partnerSocketId).emit('chat_message', {
+					text: data.text,
+					sender: 'stranger' // Received from stranger
+				});
+			} else {
+				console.log(`User ${socket.id} has no partner to chat with.`);
+			}
+		});
+	}
+
+	private joinQueue(socketId: string, name: string) {
+		// If already in queue/users, update or ignore
+		if (this.users.has(socketId)) {
+			// Possibly updating name or re-joining?
+			// For simplicity, treat as new join
+			this.handleDisconnect(socketId);
+		}
+
+		console.log(`User joining queue: ${socketId} (${name})`);
+
 		const user: User = {
-			id: userId,
+			id: uuidv4(),
+			socketId: socketId,
 			name: name || 'Stranger',
-			lastPoll: Date.now(),
-			partnerId: null,
+			partnerSocketId: null,
 			agoraChannel: null,
 			isInitiator: false
 		};
 
-		this.users.set(userId, user);
-		this.queue.push(userId);
+		this.users.set(socketId, user);
+		this.queue.push(socketId);
 		this.tryMatch();
-
-		console.log(`User joined: ${userId} (${user.name})`);
-		return { userId };
-	}
-
-	public poll(userId: string): {
-		status: 'waiting' | 'matched',
-		partnerName?: string,
-		agoraChannel?: string,
-		token?: string | null
-	} | null {
-		const user = this.users.get(userId);
-		if (!user) return null;
-
-		user.lastPoll = Date.now();
-
-		if (user.partnerId) {
-			const partner = this.users.get(user.partnerId);
-			if (!partner) {
-				// Partner disappeared
-				this.handleDisconnect(user.partnerId); // Ensure cleanup
-				user.partnerId = null;
-				user.agoraChannel = null;
-				this.queue.push(userId); // Re-queue
-				return { status: 'waiting' };
-			}
-
-			return {
-				status: 'matched',
-				partnerName: partner.name,
-				agoraChannel: user.agoraChannel!,
-				token: null // In a real app, generate Agora token here
-			};
-		}
-
-		return { status: 'waiting' };
-	}
-
-	public leave(userId: string) {
-		this.handleDisconnect(userId);
 	}
 
 	private tryMatch() {
-		if (this.queue.length >= 2) {
-			const user1Id = this.queue.shift()!;
-			const user2Id = this.queue.shift()!;
+		// Filter out disconnected sockets just in case
+		this.queue = this.queue.filter(id => this.users.has(id));
 
-			const user1 = this.users.get(user1Id);
-			const user2 = this.users.get(user2Id);
+		if (this.queue.length >= 2) {
+			const socket1Id = this.queue.shift()!;
+			const socket2Id = this.queue.shift()!;
+
+			const user1 = this.users.get(socket1Id);
+			const user2 = this.users.get(socket2Id);
 
 			if (!user1 || !user2) {
-				// One of them might have disconnected in the meantime
-				if (user1) this.queue.unshift(user1Id);
-				if (user2) this.queue.unshift(user2Id);
+				// Should not happen due to filter above, but safety check
+				if (user1) this.queue.unshift(socket1Id);
+				if (user2) this.queue.unshift(socket2Id);
 				return;
 			}
 
 			const channelName = uuidv4();
 
-			user1.partnerId = user2Id;
+			user1.partnerSocketId = socket2Id;
 			user1.agoraChannel = channelName;
 			user1.isInitiator = true;
 
-			user2.partnerId = user1Id;
+			user2.partnerSocketId = socket1Id;
 			user2.agoraChannel = channelName;
 			user2.isInitiator = false;
 
-			console.log(`Matched ${user1.name} with ${user2.name} in channel ${channelName}`);
+			console.log(`Matched ${user1.name} (${socket1Id}) with ${user2.name} (${socket2Id})`);
+
+			// Emit match events
+			this.io.to(socket1Id).emit('match_found', {
+				partnerName: user2.name,
+				agoraChannel: channelName,
+				isInitiator: true,
+				token: null // Generate real token if needed
+			});
+
+			this.io.to(socket2Id).emit('match_found', {
+				partnerName: user1.name,
+				agoraChannel: channelName,
+				isInitiator: false,
+				token: null
+			});
 		}
 	}
 
-	private handleDisconnect(userId: string) {
-		const user = this.users.get(userId);
+	private handleDisconnect(socketId: string) {
+		const user = this.users.get(socketId);
 		if (!user) return;
 
+		console.log(`User disconnected/left: ${socketId}`);
+
 		// Remove from queue
-		this.queue = this.queue.filter(id => id !== userId);
+		this.queue = this.queue.filter(id => id !== socketId);
+		this.users.delete(socketId);
 
-		// Notify partner if matched
-		if (user.partnerId) {
-			const partner = this.users.get(user.partnerId);
+		// Notify partner
+		if (user.partnerSocketId) {
+			const partner = this.users.get(user.partnerSocketId);
 			if (partner) {
-				partner.partnerId = null;
+				// Notify partner their stranger left
+				this.io.to(user.partnerSocketId).emit('partner_disconnected');
+
+				// Reset partner state
+				partner.partnerSocketId = null;
 				partner.agoraChannel = null;
-				// We don't automatically re-queue the partner here, 
-				// the poll response will handle it when they see partner is gone
-				// or we can re-queue them immediately? 
-				// Let's let the poll logic handle it to avoid race conditions.
-				// Actually, for better UX, let's just clear the link.
-			}
-		}
+				partner.isInitiator = false;
 
-		this.users.delete(userId);
-		console.log(`User disconnected/removed: ${userId}`);
-	}
-
-	private cleanup() {
-		const now = Date.now();
-		for (const [userId, user] of this.users.entries()) {
-			if (now - user.lastPoll > this.USER_TIMEOUT) {
-				this.handleDisconnect(userId);
+				// Optional: Automatically re-queue them?
+				// Usually Omegle just stops and asks 'New Chat?'
+				// We'll let client handle 'New Chat' click.
 			}
 		}
 	}
 }
+

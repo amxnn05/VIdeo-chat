@@ -3,108 +3,124 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.Matchmaker = void 0;
 const uuid_1 = require("uuid");
 class Matchmaker {
-    constructor() {
-        this.queue = [];
-        this.users = new Map();
-        this.CLEANUP_INTERVAL = 5000; // 5 seconds
-        this.USER_TIMEOUT = 10000; // 10 seconds timeout for inactive users
-        // Cleanup interval to remove inactive users
-        setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
+    constructor(io) {
+        this.queue = []; // socketIds
+        this.users = new Map(); // socketId -> User
+        this.io = io;
     }
-    joinQueue(name) {
-        const userId = (0, uuid_1.v4)();
+    handleConnection(socket) {
+        console.log(`User connected: ${socket.id}`);
+        socket.on('join_queue', (data) => {
+            this.joinQueue(socket.id, data.name);
+        });
+        socket.on('disconnect', () => {
+            this.handleDisconnect(socket.id);
+        });
+        socket.on('leave_queue', () => {
+            this.handleDisconnect(socket.id);
+        });
+        // WebRTC Signaling
+        socket.on('signal', (data) => {
+            const user = this.users.get(socket.id);
+            if (user && user.partnerSocketId) {
+                this.io.to(user.partnerSocketId).emit('signal', data);
+            }
+        });
+        // Chat Messages
+        socket.on('chat_message', (data) => {
+            const user = this.users.get(socket.id);
+            console.log(`Chat message from ${socket.id} to ${user === null || user === void 0 ? void 0 : user.partnerSocketId}: ${data.text}`);
+            if (user && user.partnerSocketId) {
+                this.io.to(user.partnerSocketId).emit('chat_message', {
+                    text: data.text,
+                    sender: 'stranger' // Received from stranger
+                });
+            }
+            else {
+                console.log(`User ${socket.id} has no partner to chat with.`);
+            }
+        });
+    }
+    joinQueue(socketId, name) {
+        // If already in queue/users, update or ignore
+        if (this.users.has(socketId)) {
+            // Possibly updating name or re-joining?
+            // For simplicity, treat as new join
+            this.handleDisconnect(socketId);
+        }
+        console.log(`User joining queue: ${socketId} (${name})`);
         const user = {
-            id: userId,
+            id: (0, uuid_1.v4)(),
+            socketId: socketId,
             name: name || 'Stranger',
-            lastPoll: Date.now(),
-            partnerId: null,
+            partnerSocketId: null,
             agoraChannel: null,
             isInitiator: false
         };
-        this.users.set(userId, user);
-        this.queue.push(userId);
+        this.users.set(socketId, user);
+        this.queue.push(socketId);
         this.tryMatch();
-        console.log(`User joined: ${userId} (${user.name})`);
-        return { userId };
-    }
-    poll(userId) {
-        const user = this.users.get(userId);
-        if (!user)
-            return null;
-        user.lastPoll = Date.now();
-        if (user.partnerId) {
-            const partner = this.users.get(user.partnerId);
-            if (!partner) {
-                // Partner disappeared
-                this.handleDisconnect(user.partnerId); // Ensure cleanup
-                user.partnerId = null;
-                user.agoraChannel = null;
-                this.queue.push(userId); // Re-queue
-                return { status: 'waiting' };
-            }
-            return {
-                status: 'matched',
-                partnerName: partner.name,
-                agoraChannel: user.agoraChannel,
-                token: null // In a real app, generate Agora token here
-            };
-        }
-        return { status: 'waiting' };
-    }
-    leave(userId) {
-        this.handleDisconnect(userId);
     }
     tryMatch() {
+        // Filter out disconnected sockets just in case
+        this.queue = this.queue.filter(id => this.users.has(id));
         if (this.queue.length >= 2) {
-            const user1Id = this.queue.shift();
-            const user2Id = this.queue.shift();
-            const user1 = this.users.get(user1Id);
-            const user2 = this.users.get(user2Id);
+            const socket1Id = this.queue.shift();
+            const socket2Id = this.queue.shift();
+            const user1 = this.users.get(socket1Id);
+            const user2 = this.users.get(socket2Id);
             if (!user1 || !user2) {
-                // One of them might have disconnected in the meantime
+                // Should not happen due to filter above, but safety check
                 if (user1)
-                    this.queue.unshift(user1Id);
+                    this.queue.unshift(socket1Id);
                 if (user2)
-                    this.queue.unshift(user2Id);
+                    this.queue.unshift(socket2Id);
                 return;
             }
             const channelName = (0, uuid_1.v4)();
-            user1.partnerId = user2Id;
+            user1.partnerSocketId = socket2Id;
             user1.agoraChannel = channelName;
             user1.isInitiator = true;
-            user2.partnerId = user1Id;
+            user2.partnerSocketId = socket1Id;
             user2.agoraChannel = channelName;
             user2.isInitiator = false;
-            console.log(`Matched ${user1.name} with ${user2.name} in channel ${channelName}`);
+            console.log(`Matched ${user1.name} (${socket1Id}) with ${user2.name} (${socket2Id})`);
+            // Emit match events
+            this.io.to(socket1Id).emit('match_found', {
+                partnerName: user2.name,
+                agoraChannel: channelName,
+                isInitiator: true,
+                token: null // Generate real token if needed
+            });
+            this.io.to(socket2Id).emit('match_found', {
+                partnerName: user1.name,
+                agoraChannel: channelName,
+                isInitiator: false,
+                token: null
+            });
         }
     }
-    handleDisconnect(userId) {
-        const user = this.users.get(userId);
+    handleDisconnect(socketId) {
+        const user = this.users.get(socketId);
         if (!user)
             return;
+        console.log(`User disconnected/left: ${socketId}`);
         // Remove from queue
-        this.queue = this.queue.filter(id => id !== userId);
-        // Notify partner if matched
-        if (user.partnerId) {
-            const partner = this.users.get(user.partnerId);
+        this.queue = this.queue.filter(id => id !== socketId);
+        this.users.delete(socketId);
+        // Notify partner
+        if (user.partnerSocketId) {
+            const partner = this.users.get(user.partnerSocketId);
             if (partner) {
-                partner.partnerId = null;
+                // Notify partner their stranger left
+                this.io.to(user.partnerSocketId).emit('partner_disconnected');
+                // Reset partner state
+                partner.partnerSocketId = null;
                 partner.agoraChannel = null;
-                // We don't automatically re-queue the partner here, 
-                // the poll response will handle it when they see partner is gone
-                // or we can re-queue them immediately? 
-                // Let's let the poll logic handle it to avoid race conditions.
-                // Actually, for better UX, let's just clear the link.
-            }
-        }
-        this.users.delete(userId);
-        console.log(`User disconnected/removed: ${userId}`);
-    }
-    cleanup() {
-        const now = Date.now();
-        for (const [userId, user] of this.users.entries()) {
-            if (now - user.lastPoll > this.USER_TIMEOUT) {
-                this.handleDisconnect(userId);
+                partner.isInitiator = false;
+                // Optional: Automatically re-queue them?
+                // Usually Omegle just stops and asks 'New Chat?'
+                // We'll let client handle 'New Chat' click.
             }
         }
     }
